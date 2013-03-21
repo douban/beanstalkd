@@ -48,6 +48,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_PAUSE_TUBE "pause-tube"
 #define CMD_BIND "bind"
 #define CMD_UNBIND "unbind"
+#define CMD_LIST_BINDINGS "list-bindings"
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
@@ -75,6 +76,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_PAUSE_TUBE_LEN CONSTSTRLEN(CMD_PAUSE_TUBE)
 #define CMD_BIND_LEN CONSTSTRLEN(CMD_BIND)
 #define CMD_UNBIND_LEN CONSTSTRLEN(CMD_UNBIND)
+#define CMD_LIST_BINDINGS_LEN CONSTSTRLEN(CMD_LIST_BINDINGS)
 
 #define MSG_FOUND "FOUND"
 #define MSG_NOTFOUND "NOT_FOUND\r\n"
@@ -143,7 +145,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define OP_JOBKICK 24
 #define OP_BIND 25
 #define OP_UNBIND 26
-#define TOTAL_OPS 27
+#define OP_LIST_BINDINGS 27
+#define TOTAL_OPS 28
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %u\n" \
@@ -276,6 +279,7 @@ static const char * op_names[] = {
     CMD_JOBKICK,
     CMD_BIND,
     CMD_UNBIND,
+    CMD_LIST_BINDINGS,
 };
 
 static job remove_buried_job(job j);
@@ -767,6 +771,7 @@ which_cmd(Conn *c)
     TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
     TEST_CMD(c->cmd, CMD_BIND, OP_BIND);
     TEST_CMD(c->cmd, CMD_UNBIND, OP_UNBIND);
+    TEST_CMD(c->cmd, CMD_LIST_BINDINGS, OP_LIST_BINDINGS);
     return OP_UNKNOWN;
 }
 
@@ -1719,6 +1724,9 @@ dispatch_cmd(Conn *c)
         if (!r) return reply_msg(c, MSG_NOTFOUND); 
 
         reply_line(c, STATE_SENDWORD, "UNBINDED\r\n");
+        break;
+    case OP_LIST_BINDINGS:
+        reply_line(c, STATE_SENDWORD, "LIST_BINDINGS\r\n");
         break;
     default:
         return reply_msg(c, MSG_UNKNOWN_COMMAND);
