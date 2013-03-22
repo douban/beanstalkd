@@ -1123,12 +1123,11 @@ do_list_bindings(Conn *c, ms l)
     for (i = 0; i < l->used; ++i) {
         t = l->items[i];
         if (!t->fanout.used) continue; /*it is not a exchange tube */
-        resp_z += 7 + strlen(t->name); /* including " -> {}\n"*/
+        resp_z += 3 + strlen(t->name); /* including " -> {}\n"*/
         for (j = 0; j < t->fanout.used; ++j) {
             q = t->fanout.items[j]; 
-            resp_z += 2 + strlen(q->name); /*including " ,"*/
+            resp_z += 5 + strlen(q->name); /*including " ,"*/
         }
-        resp_z-=2;
     }
     c->out_job = allocate_job(resp_z); /* fake job to hold response data */
     if (!c->out_job) return reply_serr(c, MSG_OUT_OF_MEMORY);
@@ -1142,16 +1141,11 @@ do_list_bindings(Conn *c, ms l)
     for (i = 0; i < l->used; ++i) {
         t = l->items[i];
         if (!t->fanout.used) continue; /*it is not a exchange tube */
-        buf += snprintf(buf, 6 + strlen(t->name), "%s -> {", t->name);
+        buf += snprintf(buf, 4 + strlen(t->name), "%s :\n", t->name);
         for (j = 0; j < t->fanout.used; ++j) {
             q = t->fanout.items[j];
-            if (j < t->fanout.used - 1) {
-                buf += snprintf(buf, 3 + strlen(q->name), "%s, ", q->name);
-            } else {
-                buf += snprintf(buf, 1 + strlen(q->name), "%s", q->name);
-            }
+            buf += snprintf(buf, 6 + strlen(q->name), "  - %s\n", q->name);
         }
-        buf += snprintf(buf, 3, "}\n");
     }
     buf[0] = '\r';
     buf[1] = '\n';
