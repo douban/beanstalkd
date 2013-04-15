@@ -13,6 +13,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include "dat.h"
+#include <math.h>
 
 /* job body cannot be greater than this many bytes long */
 size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
@@ -49,6 +50,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_BIND "bind"
 #define CMD_UNBIND "unbind"
 #define CMD_LIST_BINDINGS "list-bindings"
+#define CMD_LIST_BURIED "list-buried"
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
@@ -77,6 +79,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_BIND_LEN CONSTSTRLEN(CMD_BIND)
 #define CMD_UNBIND_LEN CONSTSTRLEN(CMD_UNBIND)
 #define CMD_LIST_BINDINGS_LEN CONSTSTRLEN(CMD_LIST_BINDINGS)
+#define CMD_LIST_BURIED_LEN CONSTSTRLEN(CMD_LIST_BURIED)
 
 #define MSG_FOUND "FOUND"
 #define MSG_NOTFOUND "NOT_FOUND\r\n"
@@ -146,7 +149,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define OP_BIND 25
 #define OP_UNBIND 26
 #define OP_LIST_BINDINGS 27
-#define TOTAL_OPS 28
+#define OP_LIST_BURIED 28
+#define TOTAL_OPS 29
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %u\n" \
@@ -280,6 +284,7 @@ static const char * op_names[] = {
     CMD_BIND,
     CMD_UNBIND,
     CMD_LIST_BINDINGS,
+    CMD_LIST_BURIED,
 };
 
 static job remove_buried_job(job j);
@@ -772,6 +777,7 @@ which_cmd(Conn *c)
     TEST_CMD(c->cmd, CMD_BIND, OP_BIND);
     TEST_CMD(c->cmd, CMD_UNBIND, OP_UNBIND);
     TEST_CMD(c->cmd, CMD_LIST_BINDINGS, OP_LIST_BINDINGS);
+    TEST_CMD(c->cmd, CMD_LIST_BURIED, OP_LIST_BURIED);
     return OP_UNKNOWN;
 }
 
@@ -1150,6 +1156,49 @@ do_list_bindings(Conn *c, ms l)
     buf[0] = '\r';
     buf[1] = '\n';
 
+    c->out_job_sent = 0;
+    return reply_line(c, STATE_SENDJOB, "OK %zu\r\n", resp_z - 2);
+}
+
+static void 
+do_list_buried(Conn *c, tube t) 
+{
+    char *buf;
+    size_t i, buried_num, resp_z;
+    job buried;
+    buried_num = t->stat.buried_ct;
+    resp_z = 8; /*---\n + [], \r\n*/
+    //resp_z = 32 + 11* buried_num;
+    if (buried_job_p(t)) {
+        buried = t->buried.next;
+        for (i = 0; i < buried_num; ++i) {
+            resp_z += (size_t)log10((double)buried->r.id) + 1;
+        }
+        resp_z += (buried_num - 1) * 2;
+    }
+    c->out_job = allocate_job(resp_z); /*fake job to hold response data*/
+    if (!c->out_job) return reply_serr(c, MSG_OUT_OF_MEMORY);
+
+    c->out_job->r.state = Copy;
+
+    buf = c->out_job->body;
+    buf += snprintf(buf, 5, "---\n");
+    buf += snprintf(buf, 2, "[");
+   
+    if (!buried_job_p(t))
+        goto FINISH;   
+
+    buried = t->buried.next;
+    for (i = 0; i < buried_num - 1; ++i) 
+    {
+        buf += snprintf(buf, 10, "%"PRIu64", ", buried->r.id);
+        buried = buried->next;
+    }
+    buf += snprintf(buf, 10, "%"PRIu64"", buried->r.id);
+FINISH:
+    buf[0] = ']';
+    buf[1] = '\r';
+    buf[2] = '\n';
     c->out_job_sent = 0;
     return reply_line(c, STATE_SENDJOB, "OK %zu\r\n", resp_z - 2);
 }
@@ -1773,6 +1822,10 @@ dispatch_cmd(Conn *c)
     case OP_LIST_BINDINGS:
         op_ct[type]++;
         do_list_bindings(c, &tubes);
+        break;
+    case OP_LIST_BURIED:
+        op_ct[type]++;
+        do_list_buried(c, c->use);
         break;
     default:
         return reply_msg(c, MSG_UNKNOWN_COMMAND);
