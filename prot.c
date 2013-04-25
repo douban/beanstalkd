@@ -1168,11 +1168,11 @@ do_list_buried(Conn *c, tube t)
     job buried;
     buried_num = t->stat.buried_ct;
     resp_z = 8; /*---\n + [], \r\n*/
-    //resp_z = 32 + 11* buried_num;
     if (buried_job_p(t)) {
         buried = t->buried.next;
         for (i = 0; i < buried_num; ++i) {
             resp_z += (size_t)log10((double)buried->r.id) + 1;
+            buried = buried->next;
         }
         resp_z += (buried_num - 1) * 2;
     }
@@ -1191,10 +1191,10 @@ do_list_buried(Conn *c, tube t)
     buried = t->buried.next;
     for (i = 0; i < buried_num - 1; ++i) 
     {
-        buf += snprintf(buf, 10, "%"PRIu64", ", buried->r.id);
+        buf += snprintf(buf, 25, "%"PRIu64", ", buried->r.id);
         buried = buried->next;
     }
-    buf += snprintf(buf, 10, "%"PRIu64"", buried->r.id);
+    buf += snprintf(buf, 25, "%"PRIu64"", buried->r.id);
 FINISH:
     buf[0] = ']';
     buf[1] = '\r';
