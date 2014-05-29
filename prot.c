@@ -14,6 +14,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include "dat.h"
+#include <math.h>
 
 /* job body cannot be greater than this many bytes long */
 size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
@@ -47,6 +48,10 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_STATS_TUBE "stats-tube "
 #define CMD_QUIT "quit"
 #define CMD_PAUSE_TUBE "pause-tube"
+#define CMD_BIND "bind"
+#define CMD_UNBIND "unbind"
+#define CMD_LIST_BINDINGS "list-bindings"
+#define CMD_LIST_BURIED "list-buried"
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
@@ -72,6 +77,10 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define CMD_LIST_TUBES_WATCHED_LEN CONSTSTRLEN(CMD_LIST_TUBES_WATCHED)
 #define CMD_STATS_TUBE_LEN CONSTSTRLEN(CMD_STATS_TUBE)
 #define CMD_PAUSE_TUBE_LEN CONSTSTRLEN(CMD_PAUSE_TUBE)
+#define CMD_BIND_LEN CONSTSTRLEN(CMD_BIND)
+#define CMD_UNBIND_LEN CONSTSTRLEN(CMD_UNBIND)
+#define CMD_LIST_BINDINGS_LEN CONSTSTRLEN(CMD_LIST_BINDINGS)
+#define CMD_LIST_BURIED_LEN CONSTSTRLEN(CMD_LIST_BURIED)
 
 #define MSG_FOUND "FOUND"
 #define MSG_NOTFOUND "NOT_FOUND\r\n"
@@ -86,6 +95,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define MSG_BURIED_FMT "BURIED %"PRIu64"\r\n"
 #define MSG_INSERTED_FMT "INSERTED %"PRIu64"\r\n"
 #define MSG_NOT_IGNORED "NOT_IGNORED\r\n"
+#define MSG_BINDED "BINDED\r\n"
+#define MSG_UNBINDED "UNBINDED\r\n"
 
 #define MSG_NOTFOUND_LEN CONSTSTRLEN(MSG_NOTFOUND)
 #define MSG_DELETED_LEN CONSTSTRLEN(MSG_DELETED)
@@ -94,6 +105,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define MSG_BURIED_LEN CONSTSTRLEN(MSG_BURIED)
 #define MSG_KICKED_LEN CONSTSTRLEN(MSG_KICKED)
 #define MSG_NOT_IGNORED_LEN CONSTSTRLEN(MSG_NOT_IGNORED)
+#define MSG_BINDED_LEN CONSTSTRLEN(MSG_BINDED)
 
 #define MSG_OUT_OF_MEMORY "OUT_OF_MEMORY\r\n"
 #define MSG_INTERNAL_ERROR "INTERNAL_ERROR\r\n"
@@ -136,7 +148,11 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define OP_QUIT 22
 #define OP_PAUSE_TUBE 23
 #define OP_JOBKICK 24
-#define TOTAL_OPS 25
+#define OP_BIND 25
+#define OP_UNBIND 26
+#define OP_LIST_BINDINGS 27
+#define OP_LIST_BURIED 28
+#define TOTAL_OPS 29
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %u\n" \
@@ -196,10 +212,12 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "current-jobs-reserved: %u\n" \
     "current-jobs-delayed: %u\n" \
     "current-jobs-buried: %u\n" \
+    "current-jobs-discarded: %u\n" \
     "total-jobs: %" PRIu64 "\n" \
     "current-using: %u\n" \
     "current-watching: %u\n" \
     "current-waiting: %u\n" \
+    "current-fanout: %u\n" \
     "cmd-delete: %" PRIu64 "\n" \
     "cmd-pause-tube: %u\n" \
     "pause: %" PRIu64 "\n" \
@@ -247,6 +265,8 @@ static uint64 op_ct[TOTAL_OPS], timeout_ct = 0;
 
 static Conn *dirty;
 
+static FILE *fanout_log = NULL;
+
 static const char * op_names[] = {
     "<unknown>",
     CMD_PUT,
@@ -273,6 +293,10 @@ static const char * op_names[] = {
     CMD_QUIT,
     CMD_PAUSE_TUBE,
     CMD_JOBKICK,
+    CMD_BIND,
+    CMD_UNBIND,
+    CMD_LIST_BINDINGS,
+    CMD_LIST_BURIED,
 };
 
 static job remove_buried_job(job j);
@@ -707,7 +731,7 @@ check_err(Conn *c, const char *s)
     if (errno == EINTR) return;
     if (errno == EWOULDBLOCK) return;
 
-    twarn("%s", s);
+    //twarn("%s", s);
     c->state = STATE_CLOSE;
     return;
 }
@@ -763,6 +787,10 @@ which_cmd(Conn *c)
     TEST_CMD(c->cmd, CMD_LIST_TUBES, OP_LIST_TUBES);
     TEST_CMD(c->cmd, CMD_QUIT, OP_QUIT);
     TEST_CMD(c->cmd, CMD_PAUSE_TUBE, OP_PAUSE_TUBE);
+    TEST_CMD(c->cmd, CMD_BIND, OP_BIND);
+    TEST_CMD(c->cmd, CMD_UNBIND, OP_UNBIND);
+    TEST_CMD(c->cmd, CMD_LIST_BINDINGS, OP_LIST_BINDINGS);
+    TEST_CMD(c->cmd, CMD_LIST_BURIED, OP_LIST_BURIED);
     return OP_UNKNOWN;
 }
 
@@ -818,6 +846,61 @@ _skip(Conn *c, int n, char *line, int len)
 
 #define skip(c,n,m) (_skip(c,n,m,CONSTSTRLEN(m)))
 
+static int
+dispatch_fanout_job(Conn *c, job j)
+{
+    int i, r;
+    job n;
+    tube t;
+
+    for (i=0; i<j->tube->fanout.used; i++) {
+        t = j->tube->fanout.items[i];
+        
+        if (t->ready.len > MAX_NUMBER_OF_FANOUT_MESSAGES) {
+            t->discard_ct ++;
+            continue;
+        }
+
+        n = job_clone(j, t);
+        if (!n) return 0;
+
+        if (n->walresv) return 0;
+        n->walresv = walresvput(&c->srv->wal, n);
+        if (!n->walresv) return 0;
+
+        global_stat.total_jobs_ct++;
+        t->stat.total_jobs_ct++;
+
+        r = enqueue_job(c->srv, n, n->r.delay, 1);
+        if (r < 0) return 0;
+
+        if (r==0) { 
+            /* out of memory trying to grow the queue, so it gets buried */
+            bury_job(c->srv, n, 0);
+        }
+    }
+    return 1;
+}
+
+static int
+migrate_jobs(Conn *c, tube s, tube t)
+{
+    job j;
+
+    while (s->ready.len || s->delay.len) {
+        j = s->ready.len ? s->ready.data[0] : s->delay.data[0];
+        if (!dispatch_fanout_job(c, j)) return 0;
+        
+        if(!remove_ready_job(j)) remove_delayed_job(j); 
+
+        j->r.state = Invalid;
+        walwrite(&c->srv->wal, j);
+        walmaint(&c->srv->wal);
+        job_free(j);
+    }
+    return 1;
+}
+
 static void
 enqueue_incoming_job(Conn *c)
 {
@@ -840,6 +923,15 @@ enqueue_incoming_job(Conn *c)
     if (drain_mode) {
         job_free(j);
         return reply_serr(c, MSG_DRAINING);
+    }
+    
+    if (j->tube->fanout.used > 0) {
+        if(dispatch_fanout_job(c, j))
+            reply_line(c, STATE_SENDWORD, MSG_INSERTED_FMT, j->r.id);
+        else
+            reply_serr(c, MSG_INTERNAL_ERROR);
+        job_free(j);
+        return;
     }
 
     if (j->walresv) return reply_serr(c, MSG_INTERNAL_ERROR);
@@ -1041,6 +1133,92 @@ do_stats(Conn *c, fmt_fn fmt, void *data)
 }
 
 static void
+do_list_bindings(Conn *c, ms l)
+{
+    char *buf;
+    tube t, q;
+    size_t i, j, resp_z;
+
+    /*first, measure how big a buffer we will need*/
+    resp_z = 6; /*initial "---\n" and final "\r\n" */
+    for (i = 0; i < l->used; ++i) {
+        t = l->items[i];
+        if (!t->fanout.used) continue; /*it is not a exchange tube */
+        resp_z += 3 + strlen(t->name); /* including " -> {}\n"*/
+        for (j = 0; j < t->fanout.used; ++j) {
+            q = t->fanout.items[j]; 
+            resp_z += 5 + strlen(q->name); /*including " ,"*/
+        }
+    }
+    c->out_job = allocate_job(resp_z); /* fake job to hold response data */
+    if (!c->out_job) return reply_serr(c, MSG_OUT_OF_MEMORY);
+
+    /* Mark this job as a copy so it can be appropriately freed later on */
+    c->out_job->r.state = Copy;
+
+    /* now actually format the response */
+    buf = c->out_job->body;
+    buf += snprintf(buf, 5, "---\n");
+    for (i = 0; i < l->used; ++i) {
+        t = l->items[i];
+        if (!t->fanout.used) continue; /*it is not a exchange tube */
+        buf += snprintf(buf, 4 + strlen(t->name), "%s :\n", t->name);
+        for (j = 0; j < t->fanout.used; ++j) {
+            q = t->fanout.items[j];
+            buf += snprintf(buf, 6 + strlen(q->name), "  - %s\n", q->name);
+        }
+    }
+    buf[0] = '\r';
+    buf[1] = '\n';
+
+    c->out_job_sent = 0;
+    return reply_line(c, STATE_SENDJOB, "OK %zu\r\n", resp_z - 2);
+}
+
+static void 
+do_list_buried(Conn *c, tube t) 
+{
+    char *buf;
+    size_t i, buried_num, resp_z;
+    job buried;
+    buried_num = t->stat.buried_ct;
+    resp_z = 8; /*---\n + [], \r\n*/
+    if (buried_job_p(t)) {
+        buried = t->buried.next;
+        for (i = 0; i < buried_num; ++i) {
+            resp_z += (size_t)log10((double)buried->r.id) + 1;
+            buried = buried->next;
+        }
+        resp_z += (buried_num - 1) * 2;
+    }
+    c->out_job = allocate_job(resp_z); /*fake job to hold response data*/
+    if (!c->out_job) return reply_serr(c, MSG_OUT_OF_MEMORY);
+
+    c->out_job->r.state = Copy;
+
+    buf = c->out_job->body;
+    buf += snprintf(buf, 5, "---\n");
+    buf += snprintf(buf, 2, "[");
+   
+    if (!buried_job_p(t))
+        goto FINISH;   
+
+    buried = t->buried.next;
+    for (i = 0; i < buried_num - 1; ++i) 
+    {
+        buf += snprintf(buf, 25, "%"PRIu64", ", buried->r.id);
+        buried = buried->next;
+    }
+    buf += snprintf(buf, 25, "%"PRIu64"", buried->r.id);
+FINISH:
+    buf[0] = ']';
+    buf[1] = '\r';
+    buf[2] = '\n';
+    c->out_job_sent = 0;
+    return reply_line(c, STATE_SENDJOB, "OK %zu\r\n", resp_z - 2);
+}
+
+static void
 do_list_tubes(Conn *c, ms l)
 {
     char *buf;
@@ -1124,10 +1302,12 @@ fmt_stats_tube(char *buf, size_t size, tube t)
             t->stat.reserved_ct,
             t->delay.len,
             t->stat.buried_ct,
+            t->discard_ct,
             t->stat.total_jobs_ct,
             t->using_ct,
             t->watching_ct,
             t->stat.waiting_ct,
+            (int)(t->fanout.used),
             t->stat.total_delete_ct,
             t->stat.pause_ct,
             t->pause / 1000000000,
@@ -1188,11 +1368,11 @@ dispatch_cmd(Conn *c)
     uint count;
     job j = 0;
     byte type;
-    char *size_buf, *delay_buf, *ttr_buf, *pri_buf, *end_buf, *name;
+    char *size_buf, *delay_buf, *ttr_buf, *pri_buf, *end_buf, *name, *name2;
     uint pri, body_size;
     int64 delay, ttr;
     uint64 id;
-    tube t = NULL;
+    tube t = NULL, t2 = NULL;
 
     /* NUL-terminate this string so we can use strtol and friends */
     c->cmd[c->cmd_len - 2] = '\0';
@@ -1596,6 +1776,71 @@ dispatch_cmd(Conn *c)
         t->stat.pause_ct++;
 
         reply_line(c, STATE_SENDWORD, "PAUSED\r\n");
+        break;
+    case OP_BIND:
+        op_ct[type]++;
+        r = read_tube_name(&name, c->cmd + CMD_BIND_LEN, &delay_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+        *delay_buf = '\0'; 
+        r = read_tube_name(&name2, delay_buf+1, &delay_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+        *delay_buf = '\0'; 
+        if (strcmp(name, name2) == 0) return reply_msg(c, MSG_BAD_FORMAT);
+
+        t = tube_find_or_make(name);
+        t2 = tube_find_or_make(name2);
+        if (!t || !t2) return reply_serr(c, MSG_OUT_OF_MEMORY);
+
+        r = tube_bind(t, t2);
+        
+        if (r==1) {
+            r = migrate_jobs(c, t, t2);
+            if (fanout_log) {
+                fprintf(fanout_log, "bind %s %s\n", t->name, t2->name);
+                fflush(fanout_log);
+            }
+        }
+        
+        if (!r) return reply_serr(c, MSG_OUT_OF_MEMORY);
+
+        reply_line(c, STATE_SENDWORD, "BINDED\r\n");
+        break;
+    case OP_UNBIND:
+        op_ct[type]++;
+        r = read_tube_name(&name, c->cmd + CMD_UNBIND_LEN, &delay_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+        *delay_buf = '\0'; 
+        r = read_tube_name(&name2, delay_buf+1, &delay_buf);
+        if (r) return reply_msg(c, MSG_BAD_FORMAT);
+        *delay_buf = '\0'; 
+        if (strcmp(name, name2) == 0) return reply_msg(c, MSG_BAD_FORMAT);
+
+        if (!(t=tube_find(name))) return reply_msg(c, MSG_NOTFOUND);
+        if (!(t2=tube_find(name2))) return reply_msg(c, MSG_NOTFOUND);
+
+        tube_iref(t);
+        tube_iref(t2);
+
+        r = tube_unbind(t, t2);
+        if (r && fanout_log) {
+            fprintf(fanout_log, "unbind %s %s\n", t->name, t2->name);
+            fflush(fanout_log);
+        }
+        
+        tube_dref(t);
+        tube_dref(t2);
+
+        if (!r) return reply_msg(c, MSG_NOTFOUND); 
+
+        reply_line(c, STATE_SENDWORD, "UNBINDED\r\n");
+        break;
+    case OP_LIST_BINDINGS:
+        op_ct[type]++;
+        do_list_bindings(c, &tubes);
+        break;
+    case OP_LIST_BURIED:
+        op_ct[type]++;
+        do_list_buried(c, c->use);
         break;
     default:
         return reply_msg(c, MSG_UNKNOWN_COMMAND);
@@ -2045,4 +2290,48 @@ prot_replay(Server *s, job list)
         }
     }
     return 1;
+}
+
+int
+prot_load_fanout(char* dir)
+{
+    int i,j;
+    char path[255], cmd[20], src[255], dst[255];
+    tube st, dt;
+
+    sprintf(path, "%s/fanout.log", dir); 
+    fanout_log = fopen(path, "a+");
+    if (!fanout_log) {
+        twarnx("failed to open %s", path);
+        return -1;
+    }
+
+    fseek(fanout_log, 0, 0);
+    while(fscanf(fanout_log, "%s %s %s", cmd, src, dst)==3) {
+        st = tube_find_or_make(src);
+        dt = tube_find_or_make(dst);
+        if (!st || !dt) return -1;
+        if (strcmp(cmd, "bind") == 0) {
+            tube_bind(st, dt);
+        } else if (strcmp(cmd, "unbind") == 0) {
+            tube_unbind(st, dt);
+        } else {
+            twarnx("unknown command: %s", cmd);
+            return -1;
+        }
+    }
+    
+    if (ftruncate(fileno(fanout_log), 0)) {
+        twarnx("ftruncate failed"); 
+        return -1;
+    }
+    for (i=0; i<tubes.used; i++) {
+        tube t = tubes.items[i];
+        for (j=0; j < t->fanout.used; j++) {
+            fprintf(fanout_log, "bind %s %s\n", t->name, 
+                ((tube)t->fanout.items[j])->name); 
+        }
+    }
+    fflush(fanout_log);
+    return 0;
 }
